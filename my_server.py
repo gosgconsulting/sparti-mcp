@@ -892,43 +892,78 @@ async def get_composio_tool_schemas(toolkits: list[str], limit: int = 30) -> lis
     if client is None:
         return [{"error": "Composio SDK not available"}]
 
-    # Try a few SDK shapes — Composio's surface has shifted across versions.
+    # Composio Python SDK >= 0.8 exposes client.tools.get_raw_composio_tools(...)
+    # for batch schema fetch; older variants exposed .list. Try in order.
     items: list = []
     last_err: Exception | None = None
     user_id = _request_user_id.get() or "default"
 
-    for attempt in (
-        # Newest: client.tools.list(toolkits=[...], limit=...)
-        lambda: client.tools.list(toolkits=slugs, limit=limit) if hasattr(client, "tools") else None,
-        # Session-based: session = client.create(user_id); session.tools(toolkits=...)
-        lambda: (
-            client.create(user_id=user_id).tools(toolkits=slugs, limit=limit)
-            if hasattr(client, "create") else None
-        ),
-        # Or session.tools.list(...)
-        lambda: (
-            client.create(user_id=user_id).tools.list(toolkits=slugs, limit=limit)
-            if hasattr(client, "create") else None
-        ),
-    ):
+    def _try(fn):
+        nonlocal last_err
         try:
-            res = attempt()
-            if res is None:
-                continue
-            # SDK may return list directly, or {items: [...]}, or paginated {data:[...]}.
-            if hasattr(res, "items") and not isinstance(res, dict):
-                items = list(res.items)  # type: ignore[arg-type]
-            elif isinstance(res, dict):
-                items = list(res.get("items") or res.get("tools") or res.get("data") or [])
-            elif isinstance(res, list):
-                items = res
-            else:
-                items = list(res)
-            if items:
-                break
+            return fn()
+        except TypeError as e:
+            # Wrong kwarg name for this SDK version → record and let caller try next.
+            last_err = e
+            return None
         except Exception as e:
             last_err = e
+            return None
+
+    candidates = []
+    if hasattr(client, "tools"):
+        # Newest: client.tools.get_raw_composio_tools(toolkits=[...], user_id=, limit=)
+        if hasattr(client.tools, "get_raw_composio_tools"):
+            candidates.append(lambda: client.tools.get_raw_composio_tools(
+                toolkits=slugs, user_id=user_id, limit=limit,
+            ))
+            candidates.append(lambda: client.tools.get_raw_composio_tools(
+                toolkits=slugs, limit=limit,
+            ))
+            candidates.append(lambda: client.tools.get_raw_composio_tools(
+                user_id=user_id, toolkits=slugs,
+            ))
+        # Older naming
+        if hasattr(client.tools, "list"):
+            candidates.append(lambda: client.tools.list(toolkits=slugs, limit=limit))
+        if hasattr(client.tools, "get"):
+            candidates.append(lambda: client.tools.get(toolkits=slugs, limit=limit))
+    # Session-based
+    if hasattr(client, "create"):
+        try:
+            session = client.create(user_id=user_id)
+            session_tools = getattr(session, "tools", None)
+            if callable(session_tools):
+                candidates.append(lambda: session_tools(toolkits=slugs, limit=limit))
+            elif session_tools is not None:
+                if hasattr(session_tools, "get_raw_composio_tools"):
+                    candidates.append(lambda: session_tools.get_raw_composio_tools(
+                        toolkits=slugs, limit=limit,
+                    ))
+        except Exception as e:
+            last_err = e
+
+    for attempt in candidates:
+        res = _try(attempt)
+        if res is None:
             continue
+        # SDK may return list directly, or {items: [...]}, or paginated {data:[...]}.
+        if isinstance(res, list):
+            items = res
+        elif isinstance(res, dict):
+            items = list(res.get("items") or res.get("tools") or res.get("data") or [])
+        elif hasattr(res, "items") and not isinstance(res, dict):
+            try:
+                items = list(res.items)  # type: ignore[arg-type]
+            except Exception:
+                items = []
+        else:
+            try:
+                items = list(res)
+            except Exception:
+                items = []
+        if items:
+            break
 
     if not items and last_err is not None:
         return [{"error": f"Composio SDK error: {last_err}"}]
