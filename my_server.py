@@ -980,14 +980,14 @@ async def get_composio_tool_schemas(toolkits: list[str], limit: int = 30) -> lis
 async def api_composio_debug(_request: Request) -> Response:
     """Introspect the Composio Python SDK so we know which call shape works
     on the version Railway has installed. Reports class hierarchy + callable
-    method names; returns no data, only structure."""
+    method signatures."""
     info: dict = {
         "sdk_imported": _ComposioSdk is not None,
         "client_init_ok": False,
         "client_type": None,
         "top_level_attrs": [],
         "has_tools": False,
-        "tools_attrs": [],
+        "tools_methods": {},
         "has_create": False,
     }
     if _ComposioSdk is None:
@@ -1002,9 +1002,15 @@ async def api_composio_debug(_request: Request) -> Response:
         )[:40]
         if hasattr(client, "tools"):
             info["has_tools"] = True
-            info["tools_attrs"] = sorted(
-                a for a in dir(client.tools) if not a.startswith("_")
-            )[:40]
+            for attr in sorted(a for a in dir(client.tools) if not a.startswith("_")):
+                obj = getattr(client.tools, attr, None)
+                if not callable(obj):
+                    continue
+                try:
+                    sig = str(inspect.signature(obj))
+                except (TypeError, ValueError):
+                    sig = "(<no signature>)"
+                info["tools_methods"][attr] = sig
         info["has_create"] = hasattr(client, "create")
     except Exception as e:
         info["init_error"] = str(e)[:300]
