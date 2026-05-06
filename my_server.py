@@ -1,4 +1,5 @@
 import os
+import re
 import inspect
 import contextvars
 from dotenv import load_dotenv
@@ -23,16 +24,24 @@ COMPOSIO_API_KEY = os.getenv("COMPOSIO_API_KEY", "")
 COMPOSIO_V2 = "https://backend.composio.dev/api/v2"
 COMPOSIO_V3 = "https://backend.composio.dev/api/v3"
 
-# Holds the Composio API key extracted from the Authorization header for the current async task.
+# Per-request context vars set by middleware from incoming headers.
 _request_composio_key: contextvars.ContextVar[str] = contextvars.ContextVar(
     "_request_composio_key", default=""
 )
+_request_user_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_request_user_id", default=""
+)
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
+)
+
+# Frontend base URL — used to build OAuth callback_url.
+SPARTI_APP_URL = os.getenv("SPARTI_APP_URL", "https://app.sparti.ai")
 
 
 class ComposioKeyMiddleware(BaseHTTPMiddleware):
-    """Extract the Bearer token from each request and store it in a ContextVar
-    so MCP tool handlers can use the caller's Composio API key without sharing
-    global state across concurrent requests."""
+    """Extracts Bearer token → COMPOSIO_API_KEY ContextVar for the request."""
 
     async def dispatch(self, request: Request, call_next: object):
         auth = request.headers.get("authorization", "")
@@ -43,6 +52,20 @@ class ComposioKeyMiddleware(BaseHTTPMiddleware):
         finally:
             if token is not None:
                 _request_composio_key.reset(token)
+
+
+class UserIdMiddleware(BaseHTTPMiddleware):
+    """Extracts X-Sparti-User-Id header → user_id ContextVar for the request.
+    The mcp-proxy edge function injects this header from the verified JWT."""
+
+    async def dispatch(self, request: Request, call_next: object):
+        user_id = request.headers.get("x-sparti-user-id", "")
+        token = _request_user_id.set(user_id) if user_id else None
+        try:
+            return await call_next(request)
+        finally:
+            if token is not None:
+                _request_user_id.reset(token)
 
 
 def _effective_composio_key() -> str:
@@ -227,11 +250,13 @@ async def connect_composio_app(
             "Configure it in the Sparti Integrations page before connecting from chat."
         }
 
+    # Default callback_url redirects the user back to our Integrations page.
+    effective_callback = callback_url or f"{SPARTI_APP_URL}/integrations?composio_success={toolkit}"
     body: dict = {
         "auth_config": {"id": auth_config_id},
         "connection": {
             "user_id": entity_id,
-            **({"callback_url": callback_url} if callback_url else {}),
+            "callback_url": effective_callback,
             "extra_params": {"prompt": "select_account"},
         },
         "force_new_integration": True,
@@ -261,7 +286,7 @@ async def connect_composio_app(
             flat = {
                 "auth_config_id": auth_config_id,
                 "user_id": entity_id,
-                **({"callback_url": callback_url} if callback_url else {}),
+                "callback_url": effective_callback,
                 "force_new_integration": True,
             }
             res = await client.post(
@@ -293,6 +318,72 @@ async def connect_composio_app(
         "status": json_body.get("status"),
         "toolkit": toolkit,
         "entity_id": entity_id,
+    }
+
+
+@mcp.tool
+async def save_composio_connection(
+    connection_id: str,
+    toolkit_slug: str,
+    entity_id: str = "default",
+) -> dict:
+    """Verify a Composio connection is ACTIVE and persist it to the Supabase
+    composio_connections table so it appears on the Integrations page.
+    Call this AFTER the user confirms they completed the OAuth authorization.
+    entity_id is the brand id (UUID) or 'default' for account-level."""
+    user_id = _request_user_id.get()
+    if not user_id:
+        return {"error": "No user identity available — save skipped. Ask the user to refresh and try again."}
+    if not _effective_composio_key():
+        return {"error": "COMPOSIO_API_KEY not configured"}
+
+    # Verify the connection is ACTIVE in Composio.
+    try:
+        data = await _composio_get(f"/connected_accounts/{connection_id}")
+        status = data.get("status", "")
+        if status != "ACTIVE":
+            return {
+                "error": f"Connection is not yet ACTIVE (status={status!r}). "
+                "Please complete the OAuth authorization first, then try again."
+            }
+        resolved_slug = (
+            (data.get("toolkit") or {}).get("slug") or toolkit_slug
+        ).lower()
+        display_name = data.get("display_name") or data.get("displayName") or None
+        auth_config_id = (data.get("authConfig") or {}).get("id") or data.get("auth_config_id") or None
+    except Exception as e:
+        return {"error": f"Could not verify connection with Composio: {e}"}
+
+    # Resolve brand_id: valid UUID → brand scope; anything else → account scope (null).
+    brand_id = entity_id if (entity_id and entity_id != "default" and _UUID_RE.match(entity_id)) else None
+
+    # Persist to Supabase (service-role client bypasses RLS).
+    try:
+        row: dict = {
+            "user_id": user_id,
+            "toolkit_slug": resolved_slug,
+            "connection_id": connection_id,
+            "status": "ACTIVE",
+        }
+        if display_name:
+            row["display_name"] = display_name
+        if auth_config_id:
+            row["auth_config_id"] = auth_config_id
+        if brand_id:
+            row["brand_id"] = brand_id
+
+        supabase.table("composio_connections").upsert(
+            row, on_conflict="user_id,toolkit_slug,connection_id"
+        ).execute()
+    except Exception as e:
+        return {"error": f"Composio connection verified but DB save failed: {e}"}
+
+    return {
+        "ok": True,
+        "connection_id": connection_id,
+        "toolkit": resolved_slug,
+        "brand_id": brand_id,
+        "display_name": display_name,
     }
 
 
@@ -358,4 +449,5 @@ async def api_execute_tool(request: Request) -> Response:
 # ── ASGI app (with middleware) — used by uvicorn entrypoint ───────────────────
 
 app = mcp.http_app()
+app.add_middleware(UserIdMiddleware)
 app.add_middleware(ComposioKeyMiddleware)
