@@ -31,6 +31,9 @@ _request_composio_key: contextvars.ContextVar[str] = contextvars.ContextVar(
 _request_user_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "_request_user_id", default=""
 )
+_request_user_jwt: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_request_user_jwt", default=""
+)
 
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
@@ -52,17 +55,36 @@ class ComposioKeyMiddleware(BaseHTTPMiddleware):
 
 
 class UserIdMiddleware(BaseHTTPMiddleware):
-    """Extracts X-Sparti-User-Id header → user_id ContextVar for the request.
-    The mcp-proxy edge function injects this header from the verified JWT."""
+    """Extracts X-Sparti-User-Id and X-Sparti-User-Jwt headers into
+    per-request ContextVars. The mcp-proxy edge function injects both
+    after verifying the JWT, so MCP tools can act as the authenticated
+    user against Supabase (RLS-aware)."""
 
     async def dispatch(self, request: Request, call_next: object):
         user_id = request.headers.get("x-sparti-user-id", "")
-        token = _request_user_id.set(user_id) if user_id else None
+        user_jwt = request.headers.get("x-sparti-user-jwt", "")
+        id_token = _request_user_id.set(user_id) if user_id else None
+        jwt_token = _request_user_jwt.set(user_jwt) if user_jwt else None
         try:
             return await call_next(request)
         finally:
-            if token is not None:
-                _request_user_id.reset(token)
+            if id_token is not None:
+                _request_user_id.reset(id_token)
+            if jwt_token is not None:
+                _request_user_jwt.reset(jwt_token)
+
+
+def _user_supabase() -> Client:
+    """Return a Supabase client authenticated as the calling user (RLS-aware).
+    Falls back to the static anon-key client when no JWT is in context."""
+    jwt = _request_user_jwt.get()
+    if not jwt:
+        return supabase
+    client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    # postgrest.auth() sets the Authorization header on PostgREST calls; RLS
+    # then sees auth.uid() = user_id and the policy allows the operation.
+    client.postgrest.auth(jwt)
+    return client
 
 
 def _effective_composio_key() -> str:
@@ -370,7 +392,9 @@ async def save_composio_connection(
         if brand_id:
             row["brand_id"] = brand_id
 
-        supabase.table("composio_connections").upsert(
+        # Use a JWT-authenticated client so RLS sees the request as the user
+        # and allows the insert (auth.uid() = user_id policy).
+        _user_supabase().table("composio_connections").upsert(
             row, on_conflict="user_id,toolkit_slug,connection_id"
         ).execute()
     except Exception as e:
