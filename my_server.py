@@ -39,6 +39,35 @@ _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
 )
 
+# Hard allowlist of tables the generic `query_table` / `insert_row` / `update_rows`
+# tools are allowed to touch. Anything not in this list is rejected — protects
+# against prompt-injection abuse asking the LLM to read auth.users / api_keys / etc.
+# High-level domain tools (update_workflow, save_composio_connection) are NOT
+# bound by this list — they're per-table by construction.
+TABLE_ALLOWLIST: set[str] = {
+    "ai_workflows",
+    "ai_workflow_steps",
+    "ai_workflow_inputs",
+    "ai_workflow_runs",
+    "learning_workflows",
+    "learning_workflow_steps",
+    "agent_jobs",
+    "agent_tool_calls",
+    "composio_connections",
+    "brands",
+    "brand_briefs",
+}
+
+
+def _check_table_allowed(table: str) -> dict | None:
+    """Return an error dict if the table isn't in TABLE_ALLOWLIST, else None."""
+    if table not in TABLE_ALLOWLIST:
+        return {
+            "error": f"Table '{table}' is not allowed via generic ops. "
+            f"Allowed: {sorted(TABLE_ALLOWLIST)}. Ask for a specific tool if you need a different table."
+        }
+    return None
+
 
 class ComposioKeyMiddleware(BaseHTTPMiddleware):
     """Extracts Bearer token → COMPOSIO_API_KEY ContextVar for the request."""
@@ -105,9 +134,14 @@ def greet(name: str) -> str:
 
 
 @mcp.tool
-def query_table(table: str, limit: int = 10, filters: dict | None = None) -> list:
-    """Fetch rows from any Sparti Supabase table. Optionally pass filters as {column: value}."""
-    q = supabase.table(table).select("*").limit(limit)
+def query_table(table: str, limit: int = 10, filters: dict | None = None) -> list | dict:
+    """Read rows from an allow-listed Sparti Supabase table (RLS-aware — returns
+    only rows the calling user is permitted to see). Pass filters as {column: value}.
+    Allowed tables: see TABLE_ALLOWLIST in the server source."""
+    err = _check_table_allowed(table)
+    if err:
+        return [err]
+    q = _user_supabase().table(table).select("*").limit(limit)
     if filters:
         for col, val in filters.items():
             q = q.eq(col, val)
@@ -115,17 +149,104 @@ def query_table(table: str, limit: int = 10, filters: dict | None = None) -> lis
 
 
 @mcp.tool
-def insert_row(table: str, data: dict) -> list:
-    """Insert a row into a Sparti table. Returns the inserted record."""
-    return supabase.table(table).insert(data).execute().data
+def insert_row(table: str, data: dict) -> list | dict:
+    """Insert a row into an allow-listed Sparti table (RLS-aware). Returns the
+    inserted record, or an error dict on policy/allowlist failure."""
+    err = _check_table_allowed(table)
+    if err:
+        return [err]
+    return _user_supabase().table(table).insert(data).execute().data
 
 
 @mcp.tool
-def update_rows(table: str, filters: dict, updates: dict) -> list:
-    """Update rows matching filters in a Sparti table. Returns updated records."""
-    q = supabase.table(table).update(updates)
+def update_rows(table: str, filters: dict, updates: dict) -> list | dict:
+    """Update rows matching filters in an allow-listed Sparti table (RLS-aware).
+    Returns updated records, or an error dict on policy/allowlist failure."""
+    err = _check_table_allowed(table)
+    if err:
+        return [err]
+    q = _user_supabase().table(table).update(updates)
     for col, val in filters.items():
         q = q.eq(col, val)
+    return q.execute().data
+
+
+# ── Workflow / agent data ops (high-level, RLS-aware) ─────────────────────────
+
+@mcp.tool
+def list_workflows(brand_id: str | None = None, limit: int = 50) -> list:
+    """List ai_workflows visible to the current user (optionally filtered by brand).
+    Returns id, name, description, brand_id, status, updated_at."""
+    q = (
+        _user_supabase()
+        .table("ai_workflows")
+        .select("id, name, description, brand_id, status, updated_at")
+        .order("updated_at", desc=True)
+        .limit(limit)
+    )
+    if brand_id:
+        q = q.eq("brand_id", brand_id)
+    return q.execute().data
+
+
+@mcp.tool
+def get_workflow(workflow_id: str) -> dict:
+    """Get a single workflow with its steps and inputs."""
+    sb = _user_supabase()
+    wf = sb.table("ai_workflows").select("*").eq("id", workflow_id).maybeSingle().execute().data
+    if not wf:
+        return {"error": f"Workflow {workflow_id} not found or not visible to you"}
+    steps = sb.table("ai_workflow_steps").select("*").eq("workflow_id", workflow_id).order("position").execute().data
+    inputs = sb.table("ai_workflow_inputs").select("*").eq("workflow_id", workflow_id).execute().data
+    return {"workflow": wf, "steps": steps or [], "inputs": inputs or []}
+
+
+@mcp.tool
+def update_workflow(workflow_id: str, updates: dict) -> dict:
+    """Update an ai_workflows row. `updates` is a partial object — only fields
+    you want to change. Returns the updated row, or an error if RLS blocks it.
+    Common fields: name, description, status."""
+    res = (
+        _user_supabase()
+        .table("ai_workflows")
+        .update(updates)
+        .eq("id", workflow_id)
+        .execute()
+    )
+    if not res.data:
+        return {"error": f"Workflow {workflow_id} update failed — not found or RLS denied"}
+    return {"ok": True, "workflow": res.data[0]}
+
+
+@mcp.tool
+def update_workflow_step(step_id: str, updates: dict) -> dict:
+    """Update an ai_workflow_steps row by id. `updates` is a partial object.
+    Common fields: name, prompt, model, position, config."""
+    res = (
+        _user_supabase()
+        .table("ai_workflow_steps")
+        .update(updates)
+        .eq("id", step_id)
+        .execute()
+    )
+    if not res.data:
+        return {"error": f"Workflow step {step_id} update failed — not found or RLS denied"}
+    return {"ok": True, "step": res.data[0]}
+
+
+@mcp.tool
+def list_agent_jobs(status: str | None = None, limit: int = 50) -> list:
+    """List recent rows from agent_jobs (RLS-aware). Filter by status if given
+    (e.g. 'pending', 'running', 'completed', 'failed')."""
+    q = (
+        _user_supabase()
+        .table("agent_jobs")
+        .select("*")
+        .order("created_at", desc=True)
+        .limit(limit)
+    )
+    if status:
+        q = q.eq("status", status)
     return q.execute().data
 
 
@@ -411,7 +532,9 @@ async def save_composio_connection(
 
 @mcp.tool
 async def disconnect_composio_connection(connection_id: str) -> dict:
-    """Delete a Composio connection by id. Returns {ok, connection_id}."""
+    """Delete a Composio connection by id. Also marks the local
+    composio_connections row as INACTIVE so the Integrations page reflects it.
+    Returns {ok, connection_id}."""
     if not _effective_composio_key():
         return {"error": "COMPOSIO_API_KEY not configured"}
     async with httpx.AsyncClient() as client:
@@ -422,7 +545,190 @@ async def disconnect_composio_connection(connection_id: str) -> dict:
         )
     if not res.is_success:
         return {"error": f"Composio refused (status {res.status_code})", "connection_id": connection_id}
+
+    # Best-effort local mirror — don't fail the disconnect if RLS blocks the update.
+    try:
+        _user_supabase().table("composio_connections").update(
+            {"status": "INACTIVE"}
+        ).eq("connection_id", connection_id).execute()
+    except Exception as e:  # pragma: no cover — log but don't surface
+        print(f"[disconnect] local mirror update failed: {e}")
+
     return {"ok": True, "connection_id": connection_id}
+
+
+# ── Composio parity tools (replacing composio-proxy edge fn) ─────────────────
+
+@mcp.tool
+async def list_composio_auth_configs(toolkit: str | None = None, limit: int = 100) -> list:
+    """List Composio auth_configs available on the workspace. Filter to a single
+    toolkit slug (e.g. 'gmail') by passing it as `toolkit`. Each item has
+    {id, toolkit_slug, name, status, is_composio_managed}."""
+    if not _effective_composio_key():
+        return [{"error": "COMPOSIO_API_KEY not configured"}]
+    data = await _composio_get("/auth_configs", {"limit": limit})
+    items = data.get("items") or data.get("auth_configs") or []
+
+    out = []
+    for cfg in items:
+        slug = (
+            (cfg.get("toolkit") or {}).get("slug")
+            or cfg.get("toolkit_slug")
+            or cfg.get("appName")
+            or cfg.get("app_name")
+            or ""
+        ).lower()
+        if toolkit and slug != toolkit.lower().replace(" ", "_"):
+            continue
+        out.append({
+            "id": cfg.get("id"),
+            "toolkit_slug": slug,
+            "name": cfg.get("name") or cfg.get("display_name"),
+            "status": cfg.get("status"),
+            "is_composio_managed": cfg.get("is_composio_managed") or cfg.get("isComposioManaged"),
+        })
+    return out
+
+
+@mcp.tool
+async def list_composio_toolkits(category: str | None = None, limit: int = 200) -> list:
+    """List all Composio toolkits (apps) available for connection — what the
+    Integrations connector picker shows. Filter by category (e.g. 'productivity',
+    'ai') if provided. Each item: {slug, name, description, logo, category}."""
+    if not _effective_composio_key():
+        return [{"error": "COMPOSIO_API_KEY not configured"}]
+    params: dict = {"limit": limit}
+    if category:
+        params["category"] = category
+    data = await _composio_get("/toolkits", params)
+    items = data.get("items") or data.get("toolkits") or []
+    return [
+        {
+            "slug": it.get("slug") or it.get("appName") or it.get("name", "").lower(),
+            "name": it.get("name") or it.get("display_name"),
+            "description": it.get("description") or it.get("meta", {}).get("description"),
+            "logo": it.get("logo") or it.get("meta", {}).get("logo"),
+            "category": (it.get("categories") or [None])[0] or it.get("category"),
+        }
+        for it in items
+    ]
+
+
+@mcp.tool
+async def get_composio_tool_schemas(toolkits: list[str], limit: int = 30) -> list:
+    """Return OpenAI-shaped tool schemas for the given toolkit slugs — what the
+    chat injects into the LLM tool list. Pass only **connected** toolkits.
+    Each item: {type:'function', function:{name, description, parameters}}."""
+    if not _effective_composio_key():
+        return [{"error": "COMPOSIO_API_KEY not configured"}]
+    if not toolkits:
+        return []
+    apps = ",".join(t.lower().replace(" ", "_") for t in toolkits if t)
+    async with httpx.AsyncClient() as client:
+        res = await client.get(
+            f"{COMPOSIO_V2}/actions",
+            params={"apps": apps, "limit": limit},
+            headers=_composio_headers(),
+            timeout=20,
+        )
+        res.raise_for_status()
+        data = res.json()
+
+    schemas = []
+    for action in data.get("items", []):
+        params = action.get("parameters") or {"type": "object", "properties": {}}
+        schemas.append({
+            "type": "function",
+            "function": {
+                "name": action.get("name") or action.get("appKey"),
+                "description": action.get("description") or "",
+                "parameters": params,
+            },
+        })
+    return schemas
+
+
+@mcp.tool
+async def sync_composio_connections(brand_id: str | None = None) -> dict:
+    """Reconcile composio_connections with Composio's truth.
+    Pulls /connected_accounts (filtered to brand if brand_id is given), upserts
+    each ACTIVE row into the table, and marks any local row whose connection_id
+    no longer exists in Composio as INACTIVE. Returns {created, updated, deactivated}."""
+    user_id = _request_user_id.get()
+    if not user_id:
+        return {"error": "No user identity available"}
+    if not _effective_composio_key():
+        return {"error": "COMPOSIO_API_KEY not configured"}
+
+    # Fetch Composio truth.
+    params: dict = {"limit": 200}
+    if brand_id:
+        params["user_ids"] = brand_id
+    data = await _composio_get("/connected_accounts", params)
+    items = data.get("items") or []
+
+    sb = _user_supabase()
+    created = 0
+    updated = 0
+
+    composio_ids: set[str] = set()
+    for it in items:
+        conn_id = it.get("id") or it.get("connectionId")
+        if not conn_id:
+            continue
+        composio_ids.add(conn_id)
+        toolkit_slug = (
+            (it.get("toolkit") or {}).get("slug")
+            or it.get("toolkit_slug")
+            or it.get("appName")
+            or ""
+        ).lower()
+        if not toolkit_slug:
+            continue
+        status = it.get("status") or "ACTIVE"
+        display_name = it.get("display_name") or it.get("displayName")
+        entity_id = it.get("user_id") or it.get("userId") or it.get("entity_id")
+        row_brand_id = entity_id if (entity_id and entity_id != "default" and _UUID_RE.match(entity_id)) else None
+
+        row: dict = {
+            "user_id": user_id,
+            "toolkit_slug": toolkit_slug,
+            "connection_id": conn_id,
+            "status": status,
+        }
+        if display_name:
+            row["display_name"] = display_name
+        if row_brand_id:
+            row["brand_id"] = row_brand_id
+
+        try:
+            res = sb.table("composio_connections").upsert(
+                row, on_conflict="user_id,toolkit_slug,connection_id"
+            ).execute()
+            if res.data:
+                # Heuristic: upsert returns the row regardless. Count both.
+                updated += 1
+        except Exception as e:
+            print(f"[sync] upsert failed for {conn_id}: {e}")
+
+    # Mark stale local rows INACTIVE.
+    deactivated = 0
+    try:
+        local_rows = sb.table("composio_connections").select("id, connection_id, status").eq("user_id", user_id).execute().data or []
+        stale = [r for r in local_rows if r.get("status") == "ACTIVE" and r.get("connection_id") not in composio_ids]
+        for r in stale:
+            sb.table("composio_connections").update({"status": "INACTIVE"}).eq("id", r["id"]).execute()
+            deactivated += 1
+    except Exception as e:
+        print(f"[sync] stale-mark failed: {e}")
+
+    return {
+        "ok": True,
+        "fetched_from_composio": len(composio_ids),
+        "upserted": updated,
+        "created_or_updated": created + updated,
+        "deactivated": deactivated,
+    }
 
 
 # ── REST bridge for Supabase mcp-proxy edge function ─────────────────────────
