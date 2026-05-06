@@ -892,8 +892,10 @@ async def get_composio_tool_schemas(toolkits: list[str], limit: int = 30) -> lis
     if client is None:
         return [{"error": "Composio SDK not available"}]
 
-    # Composio Python SDK >= 0.8 exposes client.tools.get_raw_composio_tools(...)
-    # for batch schema fetch; older variants exposed .list. Try in order.
+    # Composio Python SDK 0.8+: tools.get(user_id, toolkits=, limit=) returns
+    # an OpenAI-shaped tool collection (preferred — already correctly shaped
+    # for our chat). Fall back to get_raw_composio_tools for older SDKs and
+    # manual normalisation. Signatures verified live via /api/composio-debug.
     items: list = []
     last_err: Exception | None = None
     user_id = _request_user_id.get() or "default"
@@ -902,57 +904,32 @@ async def get_composio_tool_schemas(toolkits: list[str], limit: int = 30) -> lis
         nonlocal last_err
         try:
             return fn()
-        except TypeError as e:
-            # Wrong kwarg name for this SDK version → record and let caller try next.
-            last_err = e
-            return None
         except Exception as e:
             last_err = e
             return None
 
     candidates = []
     if hasattr(client, "tools"):
-        # Newest: client.tools.get_raw_composio_tools(toolkits=[...], user_id=, limit=)
+        # Preferred: returns OpenAI-shaped collection scoped to user.
+        if hasattr(client.tools, "get"):
+            candidates.append(lambda: client.tools.get(user_id, toolkits=slugs, limit=limit))
+        # Raw fallback (no user_id parameter — schema-only, regardless of connection).
         if hasattr(client.tools, "get_raw_composio_tools"):
-            candidates.append(lambda: client.tools.get_raw_composio_tools(
-                toolkits=slugs, user_id=user_id, limit=limit,
-            ))
             candidates.append(lambda: client.tools.get_raw_composio_tools(
                 toolkits=slugs, limit=limit,
             ))
-            candidates.append(lambda: client.tools.get_raw_composio_tools(
-                user_id=user_id, toolkits=slugs,
-            ))
-        # Older naming
-        if hasattr(client.tools, "list"):
-            candidates.append(lambda: client.tools.list(toolkits=slugs, limit=limit))
-        if hasattr(client.tools, "get"):
-            candidates.append(lambda: client.tools.get(toolkits=slugs, limit=limit))
-    # Session-based
-    if hasattr(client, "create"):
-        try:
-            session = client.create(user_id=user_id)
-            session_tools = getattr(session, "tools", None)
-            if callable(session_tools):
-                candidates.append(lambda: session_tools(toolkits=slugs, limit=limit))
-            elif session_tools is not None:
-                if hasattr(session_tools, "get_raw_composio_tools"):
-                    candidates.append(lambda: session_tools.get_raw_composio_tools(
-                        toolkits=slugs, limit=limit,
-                    ))
-        except Exception as e:
-            last_err = e
 
     for attempt in candidates:
         res = _try(attempt)
         if res is None:
             continue
-        # SDK may return list directly, or {items: [...]}, or paginated {data:[...]}.
+        # Drop into a plain list. The SDK returns various shapes: list[Tool],
+        # OpenAI-shaped collection, or pydantic objects with .items.
         if isinstance(res, list):
             items = res
         elif isinstance(res, dict):
             items = list(res.get("items") or res.get("tools") or res.get("data") or [])
-        elif hasattr(res, "items") and not isinstance(res, dict):
+        elif hasattr(res, "items") and not callable(res.items):
             try:
                 items = list(res.items)  # type: ignore[arg-type]
             except Exception:
