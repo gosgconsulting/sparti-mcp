@@ -125,6 +125,33 @@ def _composio_headers() -> dict:
     return {"x-api-key": _effective_composio_key(), "Content-Type": "application/json"}
 
 
+# ── Composio Python SDK client (lazily constructed per-request) ──────────────
+# The official SDK handles whatever URL routing Composio v3 exposes — we used
+# to call /api/v3/tools/execute by hand and got 404s when their endpoints
+# moved. The SDK is the only stable contract.
+
+try:
+    from composio import Composio as _ComposioSdk  # type: ignore
+except Exception as _composio_import_err:  # pragma: no cover
+    _ComposioSdk = None
+    print(f"[composio] SDK not available: {_composio_import_err}")
+
+
+def _get_composio_client():
+    """Return a fresh Composio SDK client bound to the request's API key.
+    Returns None if the SDK isn't installed or no key is in scope."""
+    if _ComposioSdk is None:
+        return None
+    key = _effective_composio_key()
+    if not key:
+        return None
+    try:
+        return _ComposioSdk(api_key=key)
+    except Exception as e:  # pragma: no cover
+        print(f"[composio] client init failed: {e}")
+        return None
+
+
 # ── Telemetry + connection-state helpers ──────────────────────────────────────
 
 import time as _time
@@ -393,61 +420,96 @@ async def execute_composio_tool(
     toolkit_slug = _toolkit_slug_from_tool_name(tool_name)
     resolved_user_id = _resolve_execute_user_id(toolkit_slug, entity_id)
 
-    # Composio v3: POST /tools/execute with body {slug, arguments, user_id}
-    # (the `/actions/{name}/execute` v2-era endpoint returns 404 on v3.)
-    url = f"{COMPOSIO_V3}/tools/execute"
-    body = {
-        "slug": tool_name,
-        "arguments": params or {},
-        "user_id": resolved_user_id,
-    }
+    client = _get_composio_client()
+    if client is None:
+        return {
+            "error": "Composio SDK not available on the server",
+            "tool_name": tool_name,
+        }
 
     started = _now_ms()
-    status_code: int | None = None
-    err_text: str | None = None
     try:
-        async with httpx.AsyncClient() as client:
-            res = await client.post(
-                url,
-                json=body,
-                headers=_composio_headers(),
-                timeout=30,
-            )
-            status_code = res.status_code
-            if not res.is_success:
-                err_text = (res.text or "").strip()[:500]
-                _log_tool_call(
-                    toolkit_slug=toolkit_slug,
-                    tool_name=tool_name,
-                    status="error",
-                    latency_ms=_now_ms() - started,
-                    error=f"HTTP {status_code}: {err_text}",
+        # The SDK exposes execute through several call shapes depending on
+        # version; try them in order until one works. Newer SDKs:
+        # `client.tools.execute(slug=, user_id=, arguments=)`. Older:
+        # `session = client.create(user_id); session.tools.execute(action, params)`.
+        result = None
+        last_err: Exception | None = None
+
+        # Path 1: top-level tools.execute (newest API)
+        try:
+            tools_api = getattr(client, "tools", None)
+            if tools_api is not None and hasattr(tools_api, "execute"):
+                result = tools_api.execute(
+                    slug=tool_name,
+                    user_id=resolved_user_id,
+                    arguments=params or {},
                 )
-                return {
-                    "error": f"Composio refused (HTTP {status_code})",
-                    "status_code": status_code,
-                    "tool_name": tool_name,
-                    "resolved_user_id": resolved_user_id,
-                    "detail": err_text,
-                }
-            payload = res.json()
-            _log_tool_call(
-                toolkit_slug=toolkit_slug,
-                tool_name=tool_name,
-                status="ok",
-                latency_ms=_now_ms() - started,
-            )
-            _touch_connection_last_used(toolkit_slug)
-            return payload
-    except httpx.HTTPError as e:
+        except Exception as e:
+            last_err = e
+
+        # Path 2: session-based (older SDK shape)
+        if result is None:
+            try:
+                if hasattr(client, "create"):
+                    session = client.create(user_id=resolved_user_id)
+                    session_tools = getattr(session, "tools", None)
+                    if session_tools is not None and hasattr(session_tools, "execute"):
+                        result = session_tools.execute(
+                            action=tool_name,
+                            params=params or {},
+                        )
+                    elif callable(session_tools):
+                        # session.tools() returns a list; fall through
+                        pass
+            except Exception as e:
+                last_err = e
+
+        # Path 3: direct executeToolCall (matches @composio/core JS shape)
+        if result is None:
+            try:
+                if hasattr(client, "execute_tool"):
+                    result = client.execute_tool(
+                        tool_name,
+                        params or {},
+                        user_id=resolved_user_id,
+                    )
+            except Exception as e:
+                last_err = e
+
+        if result is None:
+            raise last_err or RuntimeError("Composio SDK exposes no compatible execute method")
+
+        _log_tool_call(
+            toolkit_slug=toolkit_slug,
+            tool_name=tool_name,
+            status="ok",
+            latency_ms=_now_ms() - started,
+        )
+        _touch_connection_last_used(toolkit_slug)
+        # Normalise result into a JSON-serialisable dict.
+        if hasattr(result, "model_dump"):
+            return result.model_dump()  # pydantic
+        if hasattr(result, "__dict__"):
+            try:
+                return dict(result.__dict__)
+            except Exception:
+                pass
+        return {"data": result} if not isinstance(result, dict) else result
+    except Exception as e:
+        msg = str(e)[:500]
         _log_tool_call(
             toolkit_slug=toolkit_slug,
             tool_name=tool_name,
             status="error",
             latency_ms=_now_ms() - started,
-            error=f"transport: {e}",
+            error=msg,
         )
-        return {"error": f"Composio transport error: {e}", "tool_name": tool_name}
+        return {
+            "error": f"Composio SDK error: {msg}",
+            "tool_name": tool_name,
+            "resolved_user_id": resolved_user_id,
+        }
 
 
 async def _composio_get(path: str, params: dict | None = None) -> dict:
@@ -768,15 +830,57 @@ async def list_composio_toolkits(category: str | None = None, limit: int = 200) 
     ]
 
 
+def _normalise_schema_item(action) -> dict | None:
+    """Pull `slug`, `description`, `parameters` out of whatever shape the
+    SDK / REST returns for a tool entry, and emit an OpenAI-shaped function."""
+    if action is None:
+        return None
+    if hasattr(action, "model_dump"):
+        try:
+            action = action.model_dump()
+        except Exception:
+            pass
+    elif hasattr(action, "__dict__"):
+        try:
+            action = dict(action.__dict__)
+        except Exception:
+            pass
+
+    if isinstance(action, dict):
+        # Some SDKs return already-OpenAI-shaped tools: {type, function: {...}}.
+        fn = action.get("function") if action.get("type") == "function" else None
+        if isinstance(fn, dict):
+            slug = fn.get("name")
+            desc = fn.get("description") or ""
+            params = fn.get("parameters") or {"type": "object", "properties": {}}
+        else:
+            slug = (
+                action.get("slug")
+                or action.get("name")
+                or action.get("toolSlug")
+                or action.get("appKey")
+            )
+            desc = action.get("description") or action.get("displayName") or ""
+            params = (
+                action.get("input_parameters")
+                or action.get("inputParameters")
+                or action.get("parameters")
+                or {"type": "object", "properties": {}}
+            )
+        if not slug:
+            return None
+        return {
+            "type": "function",
+            "function": {"name": slug, "description": desc, "parameters": params},
+        }
+    return None
+
+
 @mcp.tool
 async def get_composio_tool_schemas(toolkits: list[str], limit: int = 30) -> list:
     """Return OpenAI-shaped tool schemas for the given toolkit slugs — what the
-    chat injects into the LLM tool list. Pass only **connected** toolkits.
-    Each item: {type:'function', function:{name, description, parameters}}.
-
-    Uses Composio v3 /tools (same API version as the execute endpoint), so the
-    `slug` returned here is exactly what /tools/execute expects — no case or
-    naming drift between schema fetch and tool call.
+    chat injects into the LLM tool list. Uses the Composio SDK so schemas and
+    execute share one transport — no naming drift.
     """
     if not _effective_composio_key():
         return [{"error": "COMPOSIO_API_KEY not configured"}]
@@ -784,46 +888,93 @@ async def get_composio_tool_schemas(toolkits: list[str], limit: int = 30) -> lis
         return []
     slugs = [t.lower().replace(" ", "_") for t in toolkits if t]
 
-    async with httpx.AsyncClient() as client:
-        res = await client.get(
-            f"{COMPOSIO_V3}/tools",
-            params={"toolkits": ",".join(slugs), "limit": limit},
-            headers=_composio_headers(),
-            timeout=20,
-        )
-        if not res.is_success:
-            return [{
-                "error": f"Composio /tools refused (HTTP {res.status_code})",
-                "detail": (res.text or "").strip()[:300],
-            }]
-        data = res.json()
+    client = _get_composio_client()
+    if client is None:
+        return [{"error": "Composio SDK not available"}]
 
-    items = data.get("items") or data.get("tools") or []
+    # Try a few SDK shapes — Composio's surface has shifted across versions.
+    items: list = []
+    last_err: Exception | None = None
+    user_id = _request_user_id.get() or "default"
+
+    for attempt in (
+        # Newest: client.tools.list(toolkits=[...], limit=...)
+        lambda: client.tools.list(toolkits=slugs, limit=limit) if hasattr(client, "tools") else None,
+        # Session-based: session = client.create(user_id); session.tools(toolkits=...)
+        lambda: (
+            client.create(user_id=user_id).tools(toolkits=slugs, limit=limit)
+            if hasattr(client, "create") else None
+        ),
+        # Or session.tools.list(...)
+        lambda: (
+            client.create(user_id=user_id).tools.list(toolkits=slugs, limit=limit)
+            if hasattr(client, "create") else None
+        ),
+    ):
+        try:
+            res = attempt()
+            if res is None:
+                continue
+            # SDK may return list directly, or {items: [...]}, or paginated {data:[...]}.
+            if hasattr(res, "items") and not isinstance(res, dict):
+                items = list(res.items)  # type: ignore[arg-type]
+            elif isinstance(res, dict):
+                items = list(res.get("items") or res.get("tools") or res.get("data") or [])
+            elif isinstance(res, list):
+                items = res
+            else:
+                items = list(res)
+            if items:
+                break
+        except Exception as e:
+            last_err = e
+            continue
+
+    if not items and last_err is not None:
+        return [{"error": f"Composio SDK error: {last_err}"}]
+
     schemas: list[dict] = []
     for action in items:
-        slug = (
-            action.get("slug")
-            or action.get("name")
-            or action.get("toolSlug")
-            or action.get("appKey")
-        )
-        if not slug:
-            continue
-        params_schema = (
-            action.get("input_parameters")
-            or action.get("inputParameters")
-            or action.get("parameters")
-            or {"type": "object", "properties": {}}
-        )
-        schemas.append({
-            "type": "function",
-            "function": {
-                "name": slug,
-                "description": action.get("description") or action.get("displayName") or "",
-                "parameters": params_schema,
-            },
-        })
+        norm = _normalise_schema_item(action)
+        if norm:
+            schemas.append(norm)
     return schemas
+
+
+@mcp.custom_route("/api/composio-debug", methods=["GET"])
+async def api_composio_debug(_request: Request) -> Response:
+    """Introspect the Composio Python SDK so we know which call shape works
+    on the version Railway has installed. Reports class hierarchy + callable
+    method names; returns no data, only structure."""
+    info: dict = {
+        "sdk_imported": _ComposioSdk is not None,
+        "client_init_ok": False,
+        "client_type": None,
+        "top_level_attrs": [],
+        "has_tools": False,
+        "tools_attrs": [],
+        "has_create": False,
+    }
+    if _ComposioSdk is None:
+        return JSONResponse(info)
+
+    try:
+        client = _ComposioSdk(api_key=COMPOSIO_API_KEY or "test")
+        info["client_init_ok"] = True
+        info["client_type"] = type(client).__name__
+        info["top_level_attrs"] = sorted(
+            a for a in dir(client) if not a.startswith("_")
+        )[:40]
+        if hasattr(client, "tools"):
+            info["has_tools"] = True
+            info["tools_attrs"] = sorted(
+                a for a in dir(client.tools) if not a.startswith("_")
+            )[:40]
+        info["has_create"] = hasattr(client, "create")
+    except Exception as e:
+        info["init_error"] = str(e)[:300]
+
+    return JSONResponse(info)
 
 
 @mcp.tool
