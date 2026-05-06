@@ -36,9 +36,6 @@ _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
 )
 
-# Frontend base URL — used to build OAuth callback_url.
-SPARTI_APP_URL = os.getenv("SPARTI_APP_URL", "https://app.sparti.ai")
-
 
 class ComposioKeyMiddleware(BaseHTTPMiddleware):
     """Extracts Bearer token → COMPOSIO_API_KEY ContextVar for the request."""
@@ -250,13 +247,14 @@ async def connect_composio_app(
             "Configure it in the Sparti Integrations page before connecting from chat."
         }
 
-    # Default callback_url redirects the user back to our Integrations page.
-    effective_callback = callback_url or f"{SPARTI_APP_URL}/integrations?composio_success={toolkit}"
+    # No callback_url by default — Composio shows its built-in success page.
+    # The user closes that tab themselves and tells chat "done", which calls
+    # save_composio_connection to verify + persist the connection.
     body: dict = {
         "auth_config": {"id": auth_config_id},
         "connection": {
             "user_id": entity_id,
-            "callback_url": effective_callback,
+            **({"callback_url": callback_url} if callback_url else {}),
             "extra_params": {"prompt": "select_account"},
         },
         "force_new_integration": True,
@@ -286,7 +284,7 @@ async def connect_composio_app(
             flat = {
                 "auth_config_id": auth_config_id,
                 "user_id": entity_id,
-                "callback_url": effective_callback,
+                **({"callback_url": callback_url} if callback_url else {}),
                 "force_new_integration": True,
             }
             res = await client.post(
