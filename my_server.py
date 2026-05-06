@@ -1,9 +1,11 @@
 import os
 import inspect
+import contextvars
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from fastmcp import FastMCP
 import httpx
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
@@ -16,13 +18,40 @@ supabase: Client = create_client(
     os.environ["SUPABASE_KEY"],
 )
 
+# Fallback to env var; per-request key (from Bearer token) takes priority via _request_composio_key.
 COMPOSIO_API_KEY = os.getenv("COMPOSIO_API_KEY", "")
 COMPOSIO_V2 = "https://backend.composio.dev/api/v2"
 COMPOSIO_V3 = "https://backend.composio.dev/api/v3"
 
+# Holds the Composio API key extracted from the Authorization header for the current async task.
+_request_composio_key: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_request_composio_key", default=""
+)
+
+
+class ComposioKeyMiddleware(BaseHTTPMiddleware):
+    """Extract the Bearer token from each request and store it in a ContextVar
+    so MCP tool handlers can use the caller's Composio API key without sharing
+    global state across concurrent requests."""
+
+    async def dispatch(self, request: Request, call_next: object):
+        auth = request.headers.get("authorization", "")
+        key = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+        token = _request_composio_key.set(key) if key else None
+        try:
+            return await call_next(request)
+        finally:
+            if token is not None:
+                _request_composio_key.reset(token)
+
+
+def _effective_composio_key() -> str:
+    return _request_composio_key.get() or COMPOSIO_API_KEY
+
 
 def _composio_headers() -> dict:
-    return {"x-api-key": COMPOSIO_API_KEY, "Content-Type": "application/json"}
+    # Per-request key (from mcp-proxy Bearer) takes priority over the env-var fallback.
+    return {"x-api-key": _effective_composio_key(), "Content-Type": "application/json"}
 
 
 # ── Supabase tools ────────────────────────────────────────────────────────────
@@ -64,8 +93,8 @@ def update_rows(table: str, filters: dict, updates: dict) -> list:
 async def list_composio_tools(apps: list[str], limit: int = 20) -> list:
     """List available Composio tools for given app slugs (e.g. SLACK, GMAIL, CLICKUP).
     Returns tool names and descriptions."""
-    if not COMPOSIO_API_KEY:
-        return [{"error": "COMPOSIO_API_KEY not configured in .env"}]
+    if not _effective_composio_key():
+        return [{"error": "COMPOSIO_API_KEY not configured"}]
     params = {"apps": ",".join(apps), "limit": limit}
     async with httpx.AsyncClient() as client:
         res = await client.get(
@@ -90,8 +119,8 @@ async def execute_composio_tool(
     entity_id identifies the connected user account (default: 'default').
     For Sparti chat, pass the active brand id as entity_id to use brand-scoped credentials,
     or 'default' for account-level."""
-    if not COMPOSIO_API_KEY:
-        return {"error": "COMPOSIO_API_KEY not configured in .env"}
+    if not _effective_composio_key():
+        return {"error": "COMPOSIO_API_KEY not configured"}
     body = {"input": params, "entityId": entity_id}
     async with httpx.AsyncClient() as client:
         res = await client.post(
@@ -138,8 +167,8 @@ async def list_composio_connections(entity_id: str | None = None, limit: int = 5
     """List existing Composio connections.
     If entity_id is provided, filter to that entity (typically the active brand id).
     Returns a list of {id, toolkit, status, display_name, entity_id}."""
-    if not COMPOSIO_API_KEY:
-        return [{"error": "COMPOSIO_API_KEY not configured in .env"}]
+    if not _effective_composio_key():
+        return [{"error": "COMPOSIO_API_KEY not configured"}]
     params: dict = {"limit": limit}
     if entity_id:
         params["user_ids"] = entity_id
@@ -173,8 +202,8 @@ async def connect_composio_app(
     Returns {redirect_url, connection_id, status, toolkit, entity_id}. Present `redirect_url`
     to the user as a clickable link — they finish OAuth in their browser. Once authorized,
     the connection becomes ACTIVE and is callable via `execute_composio_tool`."""
-    if not COMPOSIO_API_KEY:
-        return {"error": "COMPOSIO_API_KEY not configured in .env"}
+    if not _effective_composio_key():
+        return {"error": "COMPOSIO_API_KEY not configured"}
 
     auth_config_id = await _resolve_auth_config_id(toolkit)
     if not auth_config_id:
@@ -255,8 +284,8 @@ async def connect_composio_app(
 @mcp.tool
 async def disconnect_composio_connection(connection_id: str) -> dict:
     """Delete a Composio connection by id. Returns {ok, connection_id}."""
-    if not COMPOSIO_API_KEY:
-        return {"error": "COMPOSIO_API_KEY not configured in .env"}
+    if not _effective_composio_key():
+        return {"error": "COMPOSIO_API_KEY not configured"}
     async with httpx.AsyncClient() as client:
         res = await client.delete(
             f"{COMPOSIO_V3}/connected_accounts/{connection_id}",
@@ -309,3 +338,9 @@ async def api_execute_tool(request: Request) -> Response:
         return JSONResponse({"result": result})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ── ASGI app (with middleware) — used by uvicorn entrypoint ───────────────────
+
+app = mcp.http_app()
+app.add_middleware(ComposioKeyMiddleware)
