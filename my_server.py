@@ -87,7 +87,9 @@ async def execute_composio_tool(
     entity_id: str = "default",
 ) -> dict:
     """Execute a Composio action by slug (e.g. SLACK_SEND_MESSAGE, GMAIL_SEND_EMAIL).
-    entity_id identifies the connected user account (default: 'default')."""
+    entity_id identifies the connected user account (default: 'default').
+    For Sparti chat, pass the active brand id as entity_id to use brand-scoped credentials,
+    or 'default' for account-level."""
     if not COMPOSIO_API_KEY:
         return {"error": "COMPOSIO_API_KEY not configured in .env"}
     body = {"input": params, "entityId": entity_id}
@@ -100,6 +102,170 @@ async def execute_composio_tool(
         )
         res.raise_for_status()
         return res.json()
+
+
+async def _composio_get(path: str, params: dict | None = None) -> dict:
+    """Internal: GET against Composio v3 with API-key headers."""
+    async with httpx.AsyncClient() as client:
+        res = await client.get(
+            f"{COMPOSIO_V3}{path}",
+            params=params or {},
+            headers=_composio_headers(),
+            timeout=15,
+        )
+        res.raise_for_status()
+        return res.json()
+
+
+async def _resolve_auth_config_id(toolkit: str) -> str | None:
+    """Find the first ENABLED auth_config for a toolkit slug (e.g. 'gmail').
+    Returns None if no auth config is configured for this toolkit on the workspace."""
+    # Composio v3 expects lowercase toolkit slugs (e.g. 'gmail', 'google_analytics').
+    slug = toolkit.lower().replace(" ", "_")
+    data = await _composio_get(
+        "/auth_configs",
+        {"toolkit": slug, "limit": 20},
+    )
+    items = data.get("items") or data.get("auth_configs") or []
+    for cfg in items:
+        if cfg.get("status") == "ENABLED" or cfg.get("enabled") is True:
+            return cfg.get("id")
+    return items[0].get("id") if items else None
+
+
+@mcp.tool
+async def list_composio_connections(entity_id: str | None = None, limit: int = 50) -> list:
+    """List existing Composio connections.
+    If entity_id is provided, filter to that entity (typically the active brand id).
+    Returns a list of {id, toolkit, status, display_name, entity_id}."""
+    if not COMPOSIO_API_KEY:
+        return [{"error": "COMPOSIO_API_KEY not configured in .env"}]
+    params: dict = {"limit": limit}
+    if entity_id:
+        params["user_ids"] = entity_id
+    data = await _composio_get("/connected_accounts", params)
+    items = data.get("items") or []
+    return [
+        {
+            "id": it.get("id"),
+            "toolkit": (it.get("toolkit") or {}).get("slug")
+            or it.get("toolkit_slug")
+            or it.get("appName"),
+            "status": it.get("status"),
+            "display_name": it.get("display_name") or it.get("displayName"),
+            "entity_id": it.get("user_id") or it.get("userId") or it.get("entity_id"),
+        }
+        for it in items
+    ]
+
+
+@mcp.tool
+async def connect_composio_app(
+    toolkit: str,
+    entity_id: str = "default",
+    callback_url: str | None = None,
+) -> dict:
+    """Start an OAuth flow to connect a Composio toolkit (Gmail, Slack, etc.) for an entity.
+
+    `entity_id` scopes the connection — pass the active brand id for brand-level access,
+    or 'default' for account-level. `toolkit` is the Composio slug (e.g. 'gmail', 'slack').
+
+    Returns {redirect_url, connection_id, status, toolkit, entity_id}. Present `redirect_url`
+    to the user as a clickable link — they finish OAuth in their browser. Once authorized,
+    the connection becomes ACTIVE and is callable via `execute_composio_tool`."""
+    if not COMPOSIO_API_KEY:
+        return {"error": "COMPOSIO_API_KEY not configured in .env"}
+
+    auth_config_id = await _resolve_auth_config_id(toolkit)
+    if not auth_config_id:
+        return {
+            "error": f"No auth_config for toolkit '{toolkit}'. "
+            "Configure it in the Sparti Integrations page before connecting from chat."
+        }
+
+    body: dict = {
+        "auth_config": {"id": auth_config_id},
+        "connection": {
+            "user_id": entity_id,
+            **({"callback_url": callback_url} if callback_url else {}),
+            "extra_params": {"prompt": "select_account"},
+        },
+        "force_new_integration": True,
+    }
+
+    async with httpx.AsyncClient() as client:
+        res = await client.post(
+            f"{COMPOSIO_V3}/connected_accounts",
+            json=body,
+            headers=_composio_headers(),
+            timeout=30,
+        )
+        json_body = res.json() if res.content else {}
+
+        # Fall back to /link when the main endpoint refuses or silently reuses an old connection.
+        redirect = (
+            json_body.get("redirectUrl")
+            or json_body.get("redirect_url")
+            or (json_body.get("connectionData") or {}).get("redirectUrl")
+            or ((json_body.get("connectionData") or {}).get("val") or {}).get("redirectUrl")
+            or ((json_body.get("connectionData") or {}).get("val") or {}).get("authUri")
+        )
+        needs_fallback = not res.is_success or (
+            res.is_success and not redirect and json_body.get("status") == "ACTIVE"
+        )
+        if needs_fallback:
+            flat = {
+                "auth_config_id": auth_config_id,
+                "user_id": entity_id,
+                **({"callback_url": callback_url} if callback_url else {}),
+                "force_new_integration": True,
+            }
+            res = await client.post(
+                f"{COMPOSIO_V3}/connected_accounts/link",
+                json=flat,
+                headers=_composio_headers(),
+                timeout=30,
+            )
+            json_body = res.json() if res.content else {}
+            redirect = (
+                json_body.get("redirectUrl")
+                or json_body.get("redirect_url")
+                or (json_body.get("connectionData") or {}).get("redirectUrl")
+                or ((json_body.get("connectionData") or {}).get("val") or {}).get("redirectUrl")
+                or ((json_body.get("connectionData") or {}).get("val") or {}).get("authUri")
+            )
+
+    if not res.is_success:
+        msg = (
+            (json_body.get("error") or {}).get("message")
+            if isinstance(json_body.get("error"), dict)
+            else None
+        ) or json_body.get("message") or json_body.get("detail") or f"Composio refused (status {res.status_code})"
+        return {"error": str(msg)}
+
+    return {
+        "redirect_url": redirect,
+        "connection_id": json_body.get("id") or json_body.get("connectionId"),
+        "status": json_body.get("status"),
+        "toolkit": toolkit,
+        "entity_id": entity_id,
+    }
+
+
+@mcp.tool
+async def disconnect_composio_connection(connection_id: str) -> dict:
+    """Delete a Composio connection by id. Returns {ok, connection_id}."""
+    if not COMPOSIO_API_KEY:
+        return {"error": "COMPOSIO_API_KEY not configured in .env"}
+    async with httpx.AsyncClient() as client:
+        res = await client.delete(
+            f"{COMPOSIO_V3}/connected_accounts/{connection_id}",
+            headers=_composio_headers(),
+            timeout=15,
+        )
+    if not res.is_success:
+        return {"error": f"Composio refused (status {res.status_code})", "connection_id": connection_id}
+    return {"ok": True, "connection_id": connection_id}
 
 
 # ── REST bridge for Supabase mcp-proxy edge function ─────────────────────────
