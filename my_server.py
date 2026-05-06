@@ -125,6 +125,62 @@ def _composio_headers() -> dict:
     return {"x-api-key": _effective_composio_key(), "Content-Type": "application/json"}
 
 
+# ── Telemetry + connection-state helpers ──────────────────────────────────────
+
+import time as _time
+
+MCP_VERSION = os.getenv("RAILWAY_GIT_COMMIT_SHA", "")[:7] or "dev"
+
+
+def _now_ms() -> int:
+    return int(_time.time() * 1000)
+
+
+def _log_tool_call(
+    *,
+    toolkit_slug: str,
+    tool_name: str,
+    status: str,
+    latency_ms: int,
+    error: str | None = None,
+) -> None:
+    """Best-effort write to composio_tool_calls. Never blocks the chat path on failure."""
+    user_id = _request_user_id.get()
+    if not user_id:
+        return
+    try:
+        row: dict = {
+            "user_id": user_id,
+            "toolkit_slug": toolkit_slug or "",
+            "tool_name": tool_name,
+            "status": status,
+            "latency_ms": latency_ms,
+        }
+        if error:
+            row["error"] = error[:1000]
+        _user_supabase().table("composio_tool_calls").insert(row).execute()
+    except Exception as e:
+        # Never fail a chat tool call because telemetry is broken.
+        print(f"[_log_tool_call] write failed: {e}")
+
+
+def _touch_connection_last_used(toolkit_slug: str) -> None:
+    """Best-effort update of last_used_at for the most recent ACTIVE connection
+    of this toolkit. Powers stale-connection UX hints."""
+    if not toolkit_slug:
+        return
+    user_id = _request_user_id.get()
+    if not user_id:
+        return
+    try:
+        from datetime import datetime, timezone
+        _user_supabase().table("composio_connections").update(
+            {"last_used_at": datetime.now(timezone.utc).isoformat()}
+        ).eq("user_id", user_id).ilike("toolkit_slug", toolkit_slug).eq("status", "ACTIVE").execute()
+    except Exception as e:
+        print(f"[_touch_connection_last_used] update failed: {e}")
+
+
 # ── Supabase tools ────────────────────────────────────────────────────────────
 
 @mcp.tool
@@ -272,6 +328,55 @@ async def list_composio_tools(apps: list[str], limit: int = 20) -> list:
     return [{"name": t["name"], "description": t.get("description", "")} for t in items]
 
 
+def _resolve_execute_user_id(toolkit_slug: str, fallback: str) -> str:
+    """Find the user_id Composio expects for this toolkit by looking up the
+    most recent ACTIVE row in composio_connections (RLS-aware). Falls back to
+    the LLM-supplied entity_id when no row exists.
+
+    The connection row's `brand_id` is what was sent as Composio's `user_id`
+    at connect time, so executes must use the same value or Composio returns
+    "no connection found" → 404.
+    """
+    user_id = _request_user_id.get()
+    if not user_id:
+        return fallback
+    try:
+        # Best-effort lookup; ignore errors and fall back gracefully.
+        slug = (toolkit_slug or "").lower()
+        if not slug:
+            return fallback
+        rows = (
+            _user_supabase()
+            .table("composio_connections")
+            .select("brand_id, connection_id, status")
+            .eq("user_id", user_id)
+            .ilike("toolkit_slug", slug)
+            .eq("status", "ACTIVE")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if rows:
+            row = rows[0]
+            # The connection's brand_id IS the entity_id Composio knows about.
+            # When null, the connection is account-scoped → entity_id = 'default'.
+            return row.get("brand_id") or "default"
+    except Exception as e:
+        print(f"[_resolve_execute_user_id] lookup failed: {e}")
+    return fallback
+
+
+def _toolkit_slug_from_tool_name(tool_name: str) -> str:
+    """Composio action names follow `<TOOLKIT>_<ACTION>` (e.g. GMAIL_FETCH_EMAILS).
+    The toolkit slug is the prefix up to the first underscore, lowercased."""
+    if not tool_name:
+        return ""
+    head = tool_name.split("_", 1)[0]
+    return head.lower()
+
+
 @mcp.tool
 async def execute_composio_tool(
     tool_name: str,
@@ -279,21 +384,70 @@ async def execute_composio_tool(
     entity_id: str = "default",
 ) -> dict:
     """Execute a Composio action by slug (e.g. SLACK_SEND_MESSAGE, GMAIL_SEND_EMAIL).
-    entity_id identifies the connected user account (default: 'default').
-    For Sparti chat, pass the active brand id as entity_id to use brand-scoped credentials,
-    or 'default' for account-level."""
+    entity_id identifies the connected user account; for chat we resolve it
+    server-side from composio_connections so the LLM doesn't have to get it
+    right. Falls back to the LLM-supplied value when no row is found."""
     if not _effective_composio_key():
         return {"error": "COMPOSIO_API_KEY not configured"}
-    body = {"input": params, "entityId": entity_id}
-    async with httpx.AsyncClient() as client:
-        res = await client.post(
-            f"{COMPOSIO_V3}/actions/{tool_name}/execute",
-            json=body,
-            headers=_composio_headers(),
-            timeout=30,
+
+    toolkit_slug = _toolkit_slug_from_tool_name(tool_name)
+    resolved_user_id = _resolve_execute_user_id(toolkit_slug, entity_id)
+
+    # Composio v3: POST /tools/execute with body {slug, arguments, user_id}
+    # (the `/actions/{name}/execute` v2-era endpoint returns 404 on v3.)
+    url = f"{COMPOSIO_V3}/tools/execute"
+    body = {
+        "slug": tool_name,
+        "arguments": params or {},
+        "user_id": resolved_user_id,
+    }
+
+    started = _now_ms()
+    status_code: int | None = None
+    err_text: str | None = None
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.post(
+                url,
+                json=body,
+                headers=_composio_headers(),
+                timeout=30,
+            )
+            status_code = res.status_code
+            if not res.is_success:
+                err_text = (res.text or "").strip()[:500]
+                _log_tool_call(
+                    toolkit_slug=toolkit_slug,
+                    tool_name=tool_name,
+                    status="error",
+                    latency_ms=_now_ms() - started,
+                    error=f"HTTP {status_code}: {err_text}",
+                )
+                return {
+                    "error": f"Composio refused (HTTP {status_code})",
+                    "status_code": status_code,
+                    "tool_name": tool_name,
+                    "resolved_user_id": resolved_user_id,
+                    "detail": err_text,
+                }
+            payload = res.json()
+            _log_tool_call(
+                toolkit_slug=toolkit_slug,
+                tool_name=tool_name,
+                status="ok",
+                latency_ms=_now_ms() - started,
+            )
+            _touch_connection_last_used(toolkit_slug)
+            return payload
+    except httpx.HTTPError as e:
+        _log_tool_call(
+            toolkit_slug=toolkit_slug,
+            tool_name=tool_name,
+            status="error",
+            latency_ms=_now_ms() - started,
+            error=f"transport: {e}",
         )
-        res.raise_for_status()
-        return res.json()
+        return {"error": f"Composio transport error: {e}", "tool_name": tool_name}
 
 
 async def _composio_get(path: str, params: dict | None = None) -> dict:
@@ -618,31 +772,55 @@ async def list_composio_toolkits(category: str | None = None, limit: int = 200) 
 async def get_composio_tool_schemas(toolkits: list[str], limit: int = 30) -> list:
     """Return OpenAI-shaped tool schemas for the given toolkit slugs — what the
     chat injects into the LLM tool list. Pass only **connected** toolkits.
-    Each item: {type:'function', function:{name, description, parameters}}."""
+    Each item: {type:'function', function:{name, description, parameters}}.
+
+    Uses Composio v3 /tools (same API version as the execute endpoint), so the
+    `slug` returned here is exactly what /tools/execute expects — no case or
+    naming drift between schema fetch and tool call.
+    """
     if not _effective_composio_key():
         return [{"error": "COMPOSIO_API_KEY not configured"}]
     if not toolkits:
         return []
-    apps = ",".join(t.lower().replace(" ", "_") for t in toolkits if t)
+    slugs = [t.lower().replace(" ", "_") for t in toolkits if t]
+
     async with httpx.AsyncClient() as client:
         res = await client.get(
-            f"{COMPOSIO_V2}/actions",
-            params={"apps": apps, "limit": limit},
+            f"{COMPOSIO_V3}/tools",
+            params={"toolkits": ",".join(slugs), "limit": limit},
             headers=_composio_headers(),
             timeout=20,
         )
-        res.raise_for_status()
+        if not res.is_success:
+            return [{
+                "error": f"Composio /tools refused (HTTP {res.status_code})",
+                "detail": (res.text or "").strip()[:300],
+            }]
         data = res.json()
 
-    schemas = []
-    for action in data.get("items", []):
-        params = action.get("parameters") or {"type": "object", "properties": {}}
+    items = data.get("items") or data.get("tools") or []
+    schemas: list[dict] = []
+    for action in items:
+        slug = (
+            action.get("slug")
+            or action.get("name")
+            or action.get("toolSlug")
+            or action.get("appKey")
+        )
+        if not slug:
+            continue
+        params_schema = (
+            action.get("input_parameters")
+            or action.get("inputParameters")
+            or action.get("parameters")
+            or {"type": "object", "properties": {}}
+        )
         schemas.append({
             "type": "function",
             "function": {
-                "name": action.get("name") or action.get("appKey"),
-                "description": action.get("description") or "",
-                "parameters": params,
+                "name": slug,
+                "description": action.get("description") or action.get("displayName") or "",
+                "parameters": params_schema,
             },
         })
     return schemas
@@ -774,8 +952,34 @@ async def api_execute_tool(request: Request) -> Response:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@mcp.custom_route("/api/health", methods=["GET"])
+async def api_health(_request: Request) -> Response:
+    """Liveness + version probe. Returns {ok, version, composio_key_present}.
+    Used by frontend retry hints and Supabase pgcron heartbeat alarms."""
+    return JSONResponse({
+        "ok": True,
+        "version": MCP_VERSION,
+        "composio_key_present": bool(COMPOSIO_API_KEY),
+        "supabase_url_present": bool(os.environ.get("SUPABASE_URL")),
+    }, headers={"X-Sparti-MCP-Version": MCP_VERSION})
+
+
+class VersionHeaderMiddleware(BaseHTTPMiddleware):
+    """Stamp every response with the running MCP version so the frontend can
+    confirm whether a deploy actually rolled out."""
+
+    async def dispatch(self, request: Request, call_next: object):
+        response = await call_next(request)
+        try:
+            response.headers["X-Sparti-MCP-Version"] = MCP_VERSION
+        except Exception:
+            pass
+        return response
+
+
 # ── ASGI app (with middleware) — used by uvicorn entrypoint ───────────────────
 
 app = mcp.http_app()
 app.add_middleware(UserIdMiddleware)
 app.add_middleware(ComposioKeyMiddleware)
+app.add_middleware(VersionHeaderMiddleware)
