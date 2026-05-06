@@ -978,6 +978,76 @@ async def api_composio_debug(_request: Request) -> Response:
 
 
 @mcp.tool
+async def reset_all_composio_connections(confirm: bool = False) -> dict:
+    """ADMIN: wipe every Composio connection for the current user — both on
+    Composio's side and our composio_connections mirror. Pass confirm=true
+    to actually delete; otherwise it returns a dry-run summary.
+
+    Use this when fresh-installing the integration after an auth schema or
+    URL change. After running, reconnect each toolkit you need."""
+    user_id = _request_user_id.get()
+    if not user_id:
+        return {"error": "No user identity available"}
+    if not _effective_composio_key():
+        return {"error": "COMPOSIO_API_KEY not configured"}
+
+    sb = _user_supabase()
+    rows = (
+        sb.table("composio_connections")
+        .select("id, connection_id, toolkit_slug, status, brand_id")
+        .eq("user_id", user_id)
+        .execute()
+        .data
+        or []
+    )
+    if not confirm:
+        return {
+            "dry_run": True,
+            "would_delete": len(rows),
+            "toolkits": sorted({r.get("toolkit_slug") for r in rows if r.get("toolkit_slug")}),
+            "hint": "Call again with confirm=true to actually wipe.",
+        }
+
+    deleted_remote = 0
+    failed_remote = 0
+    for r in rows:
+        cid = r.get("connection_id")
+        if not cid:
+            continue
+        try:
+            async with httpx.AsyncClient() as http:
+                res = await http.delete(
+                    f"{COMPOSIO_V3}/connected_accounts/{cid}",
+                    headers=_composio_headers(),
+                    timeout=15,
+                )
+                if res.is_success:
+                    deleted_remote += 1
+                else:
+                    failed_remote += 1
+        except Exception:
+            failed_remote += 1
+
+    # Local wipe — hard delete so the Integrations page reflects a fresh slate.
+    try:
+        sb.table("composio_connections").delete().eq("user_id", user_id).execute()
+    except Exception as e:
+        return {
+            "deleted_remote": deleted_remote,
+            "failed_remote": failed_remote,
+            "local_delete_error": str(e),
+        }
+
+    return {
+        "ok": True,
+        "deleted_remote": deleted_remote,
+        "failed_remote": failed_remote,
+        "deleted_local": len(rows),
+        "next_step": "Reconnect each toolkit you need via the Integrations page or 'connect <toolkit>' in chat.",
+    }
+
+
+@mcp.tool
 async def sync_composio_connections(brand_id: str | None = None) -> dict:
     """Reconcile composio_connections with Composio's truth.
     Pulls /connected_accounts (filtered to brand if brand_id is given), upserts
