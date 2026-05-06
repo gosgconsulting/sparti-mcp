@@ -147,19 +147,34 @@ async def _composio_get(path: str, params: dict | None = None) -> dict:
 
 
 async def _resolve_auth_config_id(toolkit: str) -> str | None:
-    """Find the first ENABLED auth_config for a toolkit slug (e.g. 'gmail').
-    Returns None if no auth config is configured for this toolkit on the workspace."""
-    # Composio v3 expects lowercase toolkit slugs (e.g. 'gmail', 'google_analytics').
+    """Find the first ENABLED auth_config for a toolkit slug (e.g. 'gmail', 'google_calendar').
+    Fetches all configs and filters client-side — the Composio v3 `toolkit` query param
+    is not reliably applied and would otherwise return every config (wrong first pick)."""
     slug = toolkit.lower().replace(" ", "_")
-    data = await _composio_get(
-        "/auth_configs",
-        {"toolkit": slug, "limit": 20},
-    )
+    data = await _composio_get("/auth_configs", {"limit": 100})
     items = data.get("items") or data.get("auth_configs") or []
-    for cfg in items:
+
+    def _item_slug(cfg: dict) -> str:
+        raw = (
+            (cfg.get("toolkit") or {}).get("slug")
+            or cfg.get("toolkit_slug")
+            or cfg.get("appName")
+            or cfg.get("app_name")
+            or cfg.get("name")
+            or ""
+        )
+        return raw.lower().replace("-", "_").replace(" ", "_")
+
+    matching = [cfg for cfg in items if _item_slug(cfg) == slug]
+    if not matching:
+        # Fallback: strip underscores so google_calendar matches googlecalendar, etc.
+        slug_flat = slug.replace("_", "")
+        matching = [cfg for cfg in items if _item_slug(cfg).replace("_", "") == slug_flat]
+
+    for cfg in matching:
         if cfg.get("status") == "ENABLED" or cfg.get("enabled") is True:
             return cfg.get("id")
-    return items[0].get("id") if items else None
+    return matching[0].get("id") if matching else None
 
 
 @mcp.tool
